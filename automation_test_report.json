@@ -1,0 +1,34 @@
+{
+  "timestamp": "2025-12-31T09:26:37.840530",
+  "total": 5,
+  "passed": 5,
+  "failed": 0,
+  "pass_rate": "100.0%",
+  "results": [
+    {
+      "test": "Edge自动检测",
+      "status": "PASS",
+      "details": "Edge路径：C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe"
+    },
+    {
+      "test": "持久化上下文",
+      "status": "PASS",
+      "details": "缓存大小：105.4MB"
+    },
+    {
+      "test": "静默运行模式",
+      "status": "PASS",
+      "details": "支持--silent和-s参数"
+    },
+    {
+      "test": "精准推送逻辑",
+      "status": "PASS",
+      "details": "所有检查项通过"
+    },
+    {
+      "test": "配置文件验证",
+      "status": "PASS",
+      "details": "所有配置项存在"
+    }
+  ]
+}

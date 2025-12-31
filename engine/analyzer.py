@@ -1,38 +1,116 @@
 """
-蓝海指数分析引擎
-实现蓝海指数计算算法：Index = (XHS_Heat × Average_Wants) / (Competition_Count + 1)
+🧠 蓝海指数分析引擎（v2.0 - 时间衰减进化版）
+实现蓝海指数计算算法：Index = (XHS_Heat × Average_Wants) / (Competition_Count + 1) × Time_Decay
+
+核心升级：
+- 引入时间衰减系数：24小时内新热搜 × 1.5倍权重加成
+- 支持时间戳分析：从xhs_data.json提取发布时间
+- 动态调整：热点越新，权重越高
+
+更新日志：
+- 2025-12-31: 实现时间衰减系数机制
 """
 
 from typing import Dict, Tuple
 from config import MIN_POTENTIAL_SCORE, MAX_COMPETITION
+from datetime import datetime, timedelta
+import json
+import os
 
 
 class BlueOceanAnalyzer:
-    """蓝海指数分析器"""
+    """蓝海指数分析器（时间衰减增强版）"""
+    
+    @staticmethod
+    def _calculate_time_decay_factor(timestamp: str = None, data_file: str = "xhs_data.json") -> float:
+        """
+        计算时间衰减系数
+        
+        规则：
+        - 24小时内：1.5倍加成
+        - 24-48小时：1.3倍加成
+        - 48-72小时：1.1倍加成
+        - 72小时以上：1.0倍（无加成）
+        
+        Args:
+            timestamp: 数据时间戳（ISO格式）
+            data_file: 数据文件路径（自动提取时间）
+        
+        Returns:
+            时间衰减系数（1.0-1.5）
+        """
+        try:
+            # 1. 如果提供了时间戳，直接使用
+            if timestamp:
+                data_time = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+            # 2. 否则尝试从文件读取
+            elif os.path.exists(data_file):
+                with open(data_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    # 查找时间戳字段
+                    if isinstance(data, dict):
+                        timestamp_str = data.get('timestamp') or data.get('crawl_time') or data.get('update_time')
+                        if timestamp_str:
+                            data_time = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+                        else:
+                            # 使用文件修改时间
+                            file_mtime = os.path.getmtime(data_file)
+                            data_time = datetime.fromtimestamp(file_mtime)
+                    else:
+                        # 使用文件修改时间
+                        file_mtime = os.path.getmtime(data_file)
+                        data_time = datetime.fromtimestamp(file_mtime)
+            else:
+                # 无法获取时间，返回默认值
+                return 1.0
+            
+            # 计算时间差
+            now = datetime.now()
+            time_diff = now - data_time
+            hours_ago = time_diff.total_seconds() / 3600
+            
+            # 应用衰减规则
+            if hours_ago <= 24:
+                return 1.5  # 24小时内：1.5倍热点加成
+            elif hours_ago <= 48:
+                return 1.3  # 24-48小时：1.3倍加成
+            elif hours_ago <= 72:
+                return 1.1  # 48-72小时：1.1倍加成
+            else:
+                return 1.0  # 72小时以上：无加成
+        
+        except Exception as e:
+            print(f"⚠️ 时间衰减计算失败: {e}，使用默认系数1.0")
+            return 1.0
     
     @staticmethod
     def calculate_index(
         xhs_heat: float,
         competition_count: int,
         average_wants: float = 0,
-        wants_list: list = None
+        wants_list: list = None,
+        timestamp: str = None,
+        enable_time_decay: bool = True
     ) -> float:
         """
-        计算蓝海指数
+        计算蓝海指数（时间衰减增强版）
         
         蓝海指数公式：
-        $$Index = \\frac{XHS\_Heat \\times Average\_Wants}{Competition\_Count + 1}$$
+        $$Index = \\frac{XHS\_Heat \\times Average\_Wants}{Competition\_Count + 1} \\times Time\_Decay$$
         
         其中：
         - XHS_Heat: 小红书笔记互动增长率（热度值）
         - Average_Wants: 闲鱼搜索结果前5名的平均"想要"人数
         - Competition_Count: 闲鱼同标题商品总数
+        - Time_Decay: 时间衰减系数（24h内 × 1.5）
         
         Args:
             xhs_heat: 小红书热度值
             competition_count: 闲鱼竞争对手数
             average_wants: 闲鱼平均想要数（优先使用此参数）
             wants_list: 想要数列表（如提供，则自动计算平均值）
+            timestamp: 数据时间戳（用于计算衰减系数）
+            enable_time_decay: 是否启用时间衰减（默认启用）
             
         Returns:
             蓝海指数（float）
@@ -51,11 +129,23 @@ class BlueOceanAnalyzer:
         if average_wants < 0:
             average_wants = 0
         
-        # 应用蓝海指数公式
-        # 分母加1是为了避免竞争数为0时的除零错误，同时惩罚竞争激烈的市场
-        index = (xhs_heat * average_wants) / (competition_count + 1)
+        # 计算时间衰减系数
+        time_decay = 1.0
+        if enable_time_decay:
+            time_decay = BlueOceanAnalyzer._calculate_time_decay_factor(timestamp)
         
-        return round(index, 2)
+        # 应用增强版蓝海指数公式
+        # 分母加1是为了避免竞争数为0时的除零错误，同时惩罚竞争激烈的市场
+        base_index = (xhs_heat * average_wants) / (competition_count + 1)
+        
+        # 应用时间衰减系数
+        final_index = base_index * time_decay
+        
+        # 如果应用了时间加成，输出提示
+        if time_decay > 1.0:
+            print(f"  ⏰ 时间加成: {time_decay}× (24小时内热点)")
+        
+        return round(final_index, 2)
     
     @staticmethod
     def calculate_detailed_index(xhs_data: Dict, fish_data: Dict) -> Tuple[float, Dict]:

@@ -42,8 +42,14 @@ logger = logging.getLogger(__name__)
 class NicheHunterEngine:
     """蓝海赛道猎人引擎"""
     
-    def __init__(self):
-        """初始化引擎"""
+    def __init__(self, silent_mode: bool = False):
+        """
+        初始化引擎
+        
+        Args:
+            silent_mode: 静默模式（最小日志输出）
+        """
+        self.silent_mode = silent_mode
         self.pusher = NichePushLogic() if ENABLE_WECOM_PUSH else None
         self.results = []
         self.push_records = []
@@ -111,13 +117,18 @@ class NicheHunterEngine:
             print("\n【第3步】📊 筛选优质蓝海词条...")
             top_results = BlueOceanAnalyzer.rank_results(self.results, top_results_n)
             
-            # 过滤符合推送条件的词条
-            qualified_results = [
-                r for r in top_results 
-                if BlueOceanAnalyzer.is_qualified(r['蓝海指数'], r['闲鱼商品数'])
-            ]
+            # 过滤符合推送条件的词条（必须同时满足：1. Top N排名 2. 通过is_qualified验证）
+            qualified_results = []
+            for i, result in enumerate(top_results, 1):
+                if BlueOceanAnalyzer.is_qualified(result['蓝海指数'], result['闲鱼商品数']):
+                    qualified_results.append(result)
+                    if not self.silent_mode:
+                        print(f"  ✓ 第{i}名：{result['词条']} - 蓝海指数{result['蓝海指数']:.2f}（符合推送标准）")
+                else:
+                    if not self.silent_mode:
+                        print(f"  ✗ 第{i}名：{result['词条']} - 蓝海指数{result['蓝海指数']:.2f}（不符合推送标准）")
             
-            print(f"✓ 发现 {len(qualified_results)} 个优质蓝海词条")
+            print(f"✓ Top {top_results_n} 中发现 {len(qualified_results)} 个优质蓝海词条")
             
             # 打印前5个结果
             print("\n" + "-"*70)
@@ -404,11 +415,16 @@ class NicheHunterEngine:
             logger.error(f"保存报告失败：{e}")
 
 
-def main():
-    """主程序入口"""
+def main(silent_mode: bool = False):
+    """
+    主程序入口
+    
+    Args:
+        silent_mode: 静默模式（自动headless + 最小日志输出）
+    """
     
     # 创建引擎实例
-    engine = NicheHunterEngine()
+    engine = NicheHunterEngine(silent_mode=silent_mode)
     
     # 执行任务
     result = engine.run_mission(
@@ -421,4 +437,7 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    import sys
+    # 支持命令行参数：python main.py --silent
+    silent = '--silent' in sys.argv or '-s' in sys.argv
+    main(silent_mode=silent)

@@ -122,11 +122,39 @@ class NichePushLogic:
             f"> <font color=\"warning\">{score:.2f}</font>（{rating}）",
             "",
             "**🎯 市场情况**",
-            f"> • 小红书热度：<font color=\"info\">{xhs_heat:,}</font>",
-            f"> • 闲鱼竞争：<font color=\"info\">仅 {fish_count} 个卖家</font>",
+            f"> • 小红书热度：<font color=\"info\">{xhs_heat:,}</font> 次搜索",
+            f"> • 闲鱼竞争：<font color=\"comment\">仅 {fish_count} 个卖家</font>（蓝海市场）",
             f"> • 用户需求：<font color=\"info\">平均 {avg_wants:.1f} 人想要</font>",
-            ""
+            "",
+            "**💰 市场分析**",
         ]
+        
+        # 竞争度分析
+        if fish_count < 50:
+            competition_level = "极低竞争（红利期）"
+        elif fish_count < 100:
+            competition_level = "低竞争（适合进入）"
+        elif fish_count < 200:
+            competition_level = "中等竞争（需差异化）"
+        else:
+            competition_level = "较高竞争（需谨慎）"
+        
+        message_lines.append(f"> • 竞争程度：{competition_level}")
+        
+        # 需求强度分析
+        if avg_wants >= 10:
+            demand_level = "极强需求（爆款潜力）"
+        elif avg_wants >= 5:
+            demand_level = "强需求（值得投入）"
+        elif avg_wants >= 2:
+            demand_level = "中等需求（稳定销售）"
+        else:
+            demand_level = "弱需求（谨慎尝试）"
+        
+        message_lines.extend([
+            f"> • 需求强度：{demand_level}",
+            ""
+        ])
         
         # 添加建议
         if suggest_title:

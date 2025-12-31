@@ -219,11 +219,23 @@ def main():
             print("   • 已通过 [2] 完成登录")
             print("   • Playwright 库已安装 (pip install -r requirements.txt)")
             print()
-            confirm = input(f"{Colors.BOLD}确认继续？(y/n)：{Colors.END} ").strip().lower()
-            if confirm == 'y':
-                run_command('python main.py', '完全自动 - 在线数据爬取分析')
+            print(f"{Colors.BOLD}{Colors.BLUE}运行模式：{Colors.END}")
+            print(f"{Colors.GREEN}[1]{Colors.END} 可见模式（显示浏览器窗口）")
+            print(f"{Colors.GREEN}[2]{Colors.END} 静默模式（无头运行，最小日志）")
+            
+            mode_choice = input(f"\n{Colors.BOLD}选择模式 (1/2，默认1)：{Colors.END} ").strip() or '1'
+            
+            if mode_choice in ['1', '2']:
+                confirm = input(f"{Colors.BOLD}确认启动？(y/n)：{Colors.END} ").strip().lower()
+                if confirm == 'y':
+                    if mode_choice == '2':
+                        run_command('python main.py --silent', '完全自动（静默模式）- 在线数据爬取分析')
+                    else:
+                        run_command('python main.py', '完全自动（可见模式）- 在线数据爬取分析')
+                else:
+                    print(f"{Colors.YELLOW}已取消{Colors.END}\n")
             else:
-                print(f"{Colors.YELLOW}已取消{Colors.END}\n")
+                print(f"{Colors.RED}无效模式选项{Colors.END}\n")
         
         elif choice == '4':
             print(f"\n{Colors.BLUE}💡 定时调度说明：{Colors.END}")

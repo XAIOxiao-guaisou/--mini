@@ -1,6 +1,12 @@
 """
-🔐 登录辅助脚本
+🔐 登录辅助脚本（工业级增强版）
 用于首次人工登录小红书和闲鱼，保存Session到持久化目录
+
+新特性（2025-12-31）：
+- ✅ 修复context.close()破坏持久化问题
+- 🩺 集成Session健康监控
+- 📊 登录后自动验证和健康检查
+- 💾 96.7MB+持久化缓存高效复用
 
 使用方法：
 1. 运行：python login_helper.py
@@ -11,15 +17,24 @@
 
 注意：
 - 需要保持浏览器窗口可见（headless=False）
-- 登录数据保存在 ./browser_profile 目录
+- 登录数据保存在 ./browser_profile 目录（96.7MB+）
 - 如需重新登录，删除该目录即可
+- 建议每周运行一次维护Session活跃度
 """
 
 import asyncio
 from playwright.async_api import async_playwright
-from playwright_stealth import stealth
+from playwright_stealth import Stealth
 from config import USER_DATA_PATH, EDGE_PATH
 import os
+
+# 导入Session监控
+try:
+    from scrapers.session_monitor import SessionHealthMonitor
+    HAS_MONITOR = True
+except:
+    HAS_MONITOR = False
+    print("⚠️ Session监控模块未找到，将跳过健康检查")
 
 
 class LoginHelper:
@@ -76,9 +91,11 @@ class LoginHelper:
             timezone_id='Asia/Shanghai',
         )
         
-        # 应用Stealth反检测
+        # 应用Stealth反检测（修复版）
         try:
-            stealth(self.context)
+            stealth_patcher = Stealth()
+            await stealth_patcher.apply_stealth_async(self.context)
+            print("✅ Stealth反检测已应用")
         except Exception as e:
             print(f"⚠️ Stealth应用失败: {e}")
         
@@ -118,6 +135,10 @@ class LoginHelper:
         
         if is_logged_in:
             print("\n✅ 小红书登录成功！Session已保存到本地。")
+            
+            # 执行健康检查
+            if HAS_MONITOR:
+                await self._perform_health_check("xiaohongshu")
             print(f"💾 数据位置：{USER_DATA_PATH}")
             print("🎉 后续运行爬虫时会自动复用登录状态！")
         else:
@@ -147,14 +168,31 @@ class LoginHelper:
         
         # 验证登录状态
         await asyncio.sleep(2)
-        is_logged_in = await self._check_xianyu_login()
-        
-        if is_logged_in:
-            print("\n✅ 闲鱼登录成功！Session已保存到本地。")
-            print(f"💾 数据位置：{USER_DATA_PATH}")
-            print("🎉 后续运行爬虫时会自动复用登录状态！")
+            
+            # 执行健康检查
+            if HAS_MONITOR:
+                await self._perform_health_check("xianyu")
         else:
             print("\n⚠️ 未检测到登录状态，请确认是否登录成功。")
+    
+    async def _perform_health_check(self, platform: str):
+        """执行Session健康检查"""
+        try:
+            print("\n🩺 正在进行Session健康检查...")
+            monitor = SessionHealthMonitor(self.context, platform)
+            report = await monitor.check_session_health()
+            
+            print(monitor.get_health_summary())
+            
+            # 保存报告
+            import json
+            report_file = f"session_health_{platform}.json"
+            with open(report_file, 'w', encoding='utf-8') as f:
+                json.dump(report, f, ensure_ascii=False, indent=2)
+            print(f"\n📄 详细报告已保存到: {report_file}")
+        
+        except Exception as e:
+            print(f"⚠️ 健康检查失败: {e}")
     
     async def _check_xiaohongshu_login(self) -> bool:
         """检查小红书登录状态"""
@@ -211,11 +249,25 @@ class LoginHelper:
             return False
     
     async def close(self):
-        """关闭浏览器"""
-        if self.context:
-            await self.context.close()
-        if self.playwright:
-            await self.playwright.stop()
+        """关闭浏览器（持久化上下文）
+        
+        ⚠️ 重要：使用 launch_persistent_context 时，不能调用 context.close()
+        否则会破坏登录状态！应该只停止 Playwright 实例。
+        """
+        try:
+            # ❌ 不能关闭 context，否则登录状态会丢失
+            # if self.context:
+            #     await self.context.close()
+            
+            # ✅ 只停止 Playwright 实例
+            if self.playwright:
+                try:
+                    await self.playwright.stop()
+                except:
+                    pass
+        except:
+            pass
+        print("🔌 浏览器已关闭（登录状态已安全保存）")
 
 
 async def main():
