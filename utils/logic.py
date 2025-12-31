@@ -186,6 +186,10 @@ class NichePushLogic:
             是否发送成功
         """
         
+        if not self.webhook_url:
+            print("⚠️ 未配置企业微信 Webhook（WECOM_WEBHOOK），已跳过推送")
+            return False
+
         data = {
             "msgtype": "markdown",
             "markdown": {

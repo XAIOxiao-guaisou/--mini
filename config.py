@@ -3,8 +3,14 @@
 包含企业微信推送、浏览器配置、算法阈值等参数
 """
 
+import os
+
 # ==================== 企业微信机器人配置 ====================
-WECOM_WEBHOOK = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=480bc935-8f0e-4821-bfc6-0e5829781eee"
+# ⚠️ 安全说明：不要把真实 webhook 提交到 GitHub。
+# 通过环境变量注入：
+# - PowerShell: $env:WECOM_WEBHOOK='https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxxx'
+# - CMD: set WECOM_WEBHOOK=https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxxx
+WECOM_WEBHOOK = os.getenv("WECOM_WEBHOOK", "").strip()
 
 # ==================== 浏览器配置 ====================
 # 浏览器指纹路径，确保单IP环境下Cookie持久化
@@ -37,7 +43,8 @@ PROXY_DICT = {}                      # 空代理字典（不使用任何代理�
 NO_PROXY = '*'                       # 所有域名都不使用代理
 
 # ==================== 推送配置 ====================
-ENABLE_WECOM_PUSH = True             # 是否启用企业微信推送
+# 未配置 webhook 时默认关闭推送，避免运行时报错/避免误提交敏感信息
+ENABLE_WECOM_PUSH = bool(WECOM_WEBHOOK)  # 是否启用企业微信推送
 TOP_N_RESULTS = 5                    # 推送前N个最佳赛道
 PUSH_INTERVAL = 3600                 # 推送间隔（秒），避免频繁打扰
 

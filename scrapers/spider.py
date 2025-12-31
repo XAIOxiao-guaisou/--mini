@@ -29,7 +29,8 @@ from config import DELAY_BETWEEN_REQUESTS, USER_DATA_PATH, EDGE_PATH
 from .advanced_config import (
     PREMIUM_USER_AGENTS, PREMIUM_VIEWPORTS, LIGHTWEIGHT_BROWSER_ARGS,
     DelayManager, HeaderBuilder, RetryManager, ResponseValidator,
-    RequestStats, BrowserFingerprintConfig
+    RequestStats, BrowserFingerprintConfig,
+    ActionRateController, build_webgl_canvas_noise_script
 )
 
 # 导入指纹防御和Session监控
@@ -50,6 +51,28 @@ try:
 except ImportError as e:
     print(f"⚠️  Playwright 未安装，请运行：pip install playwright playwright-stealth")
     HAS_PLAYWRIGHT = False
+
+
+class SessionInvalidError(RuntimeError):
+    """持久化Session失效或需要重新登录时抛出。"""
+
+
+def _xpath_literal(text: str) -> str:
+    """把任意字符串安全转成XPath字面量。"""
+    if text is None:
+        return "''"
+    if "'" not in text:
+        return f"'{text}'"
+    if '"' not in text:
+        return f'"{text}"'
+    parts = text.split("'")
+    concat_parts = []
+    for i, part in enumerate(parts):
+        if part:
+            concat_parts.append(f"'{part}'")
+        if i != len(parts) - 1:
+            concat_parts.append('"\'"')
+    return "concat(" + ",".join(concat_parts) + ")"
 
 
 # ========================================
@@ -122,9 +145,13 @@ class XhsSpider:
         
         # 初始化工具
         self.delay_manager = DelayManager(min_delay=1.0, max_delay=3.0)
+        self.action_controller = ActionRateController.for_xhs()
         self.retry_manager = RetryManager(max_retries=5)
         self.stats = RequestStats()
         self.playwright = None
+
+        # Network sniffing
+        self._sniff_enabled = True
         
         # 工业级防御组件
         self.fingerprint_defense = None
@@ -154,16 +181,23 @@ class XhsSpider:
         
         # 策略2：注册表查询（最准确）
         try:
-            result = subprocess.run(
-                ['reg', 'query', r'HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe', '/ve'],
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
-            if result.returncode == 0:
+            reg_keys = [
+                r'HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\msedge.exe',
+                r'HKEY_LOCAL_MACHINE\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\App Paths\\msedge.exe',
+                r'HKEY_CURRENT_USER\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\msedge.exe',
+            ]
+            for reg_key in reg_keys:
+                result = subprocess.run(
+                    ['reg', 'query', reg_key, '/ve'],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                if result.returncode != 0:
+                    continue
                 for line in result.stdout.split('\n'):
                     if 'REG_SZ' in line:
-                        path = line.split('REG_SZ')[-1].strip()
+                        path = line.split('REG_SZ')[-1].strip().strip('"')
                         if os.path.exists(path):
                             if not self.silent_mode:
                                 print(f"✓ 从注册表获取Edge路径")
@@ -193,6 +227,149 @@ class XhsSpider:
                 return path
         
         return None
+
+    async def verify_session(self, *, strict: bool = True) -> Dict:
+        """
+        ✅ 校验持久化Session是否仍然可用（小红书）。
+
+        目标：精准识别“缓存存在但已失效/未登录”的情况，并给出可执行的引导信息。
+
+        Args:
+            strict: True时遇到异常视为失败；False时异常给出unknown但不强行判失败。
+
+        Returns:
+            {
+              "ok": bool,
+              "reason": str,
+              "action": str,
+              "evidence": {...}
+            }
+        """
+        evidence: Dict = {}
+
+        # 1) 目录/缓存体积检查（快速发现“目录被清空/损坏”）
+        try:
+            profile_path = Path(USER_DATA_PATH)
+            if not profile_path.exists():
+                return {
+                    "ok": False,
+                    "reason": "profile_missing",
+                    "action": "请运行 python login_helper.py 重新登录（将自动创建 browser_profile）",
+                    "evidence": {"user_data_path": str(profile_path)}
+                }
+            size_mb = sum(f.stat().st_size for f in profile_path.rglob('*') if f.is_file()) / 1024 / 1024
+            evidence["profile_size_mb"] = round(size_mb, 1)
+            if size_mb < 5:
+                return {
+                    "ok": False,
+                    "reason": "profile_empty_or_corrupt",
+                    "action": "browser_profile 过小，疑似未登录或缓存损坏。请运行 python login_helper.py 重新登录。",
+                    "evidence": evidence
+                }
+        except Exception as e:
+            evidence["profile_check_error"] = str(e)[:200]
+            if strict:
+                return {
+                    "ok": False,
+                    "reason": "profile_check_failed",
+                    "action": "无法读取 browser_profile，请检查权限或磁盘状态；必要时重新登录。",
+                    "evidence": evidence
+                }
+
+        if not self.context or not self.page:
+            return {
+                "ok": False,
+                "reason": "browser_not_ready",
+                "action": "浏览器尚未初始化完成，请先调用 init_browser()。",
+                "evidence": evidence
+            }
+
+        # 2) Cookie检查（更稳定）
+        now_ts = time.time()
+        try:
+            cookies = await self.context.cookies("https://www.xiaohongshu.com")
+            found = {c.get('name') for c in cookies}
+            evidence["cookie_names_sample"] = sorted(list(found))[:20]
+
+            def cookie_valid(name: str) -> bool:
+                for c in cookies:
+                    if c.get('name') != name:
+                        continue
+                    exp = c.get('expires', -1)
+                    if exp in (-1, 0, None):
+                        return True
+                    try:
+                        return float(exp) > (now_ts + 300)
+                    except Exception:
+                        return True
+                return False
+
+            required = ['a1', 'webId', 'web_session']
+            valid_required = [name for name in required if (name in found and cookie_valid(name))]
+            evidence["required_cookie_valid"] = valid_required
+
+            # 经验：至少满足2个关键cookie更可靠
+            if len(valid_required) >= 2:
+                return {
+                    "ok": True,
+                    "reason": "cookies_ok",
+                    "action": "",
+                    "evidence": evidence
+                }
+        except Exception as e:
+            evidence["cookie_check_error"] = str(e)[:200]
+            if strict:
+                return {
+                    "ok": False,
+                    "reason": "cookie_check_failed",
+                    "action": "Cookie校验异常，建议重新登录或检查网络/反爬拦截。",
+                    "evidence": evidence
+                }
+
+        # 3) 页面DOM检查（最终兜底）
+        try:
+            await self.page.goto("https://www.xiaohongshu.com/", wait_until='domcontentloaded', timeout=15000)
+            await asyncio.sleep(1.5)
+            indicators = await self.page.evaluate("""
+                () => {
+                    const text = (document.body && document.body.innerText) ? document.body.innerText : '';
+                    const hasAvatar = !!document.querySelector('div.avatar, div.user-avatar, img.avatar-img, div.user-info, [class*="avatar"], [class*="user"]');
+                    const hasLoginBtn = !!document.querySelector('a[href*="login"], button:has-text("登录"), [class*="login"], [data-testid*="login"]');
+                    const maybeCaptcha = /验证|captcha|滑块|人机/.test(text);
+                    return { hasAvatar, hasLoginBtn, maybeCaptcha };
+                }
+            """)
+            evidence.update(indicators)
+
+            if indicators.get('maybeCaptcha'):
+                return {
+                    "ok": False,
+                    "reason": "captcha_or_blocked",
+                    "action": "疑似触发验证/拦截：请先运行 python login_helper.py 在可见窗口完成验证后再运行主程序。",
+                    "evidence": evidence
+                }
+            if indicators.get('hasAvatar') and not indicators.get('hasLoginBtn'):
+                return {
+                    "ok": True,
+                    "reason": "dom_ok",
+                    "action": "",
+                    "evidence": evidence
+                }
+
+            return {
+                "ok": False,
+                "reason": "not_logged_in",
+                "action": "检测到未登录：请运行 python login_helper.py 重新登录；如仍失败可先删除 browser_profile 后再登录。",
+                "evidence": evidence
+            }
+        except Exception as e:
+            evidence["dom_check_error"] = str(e)[:200]
+            return {
+                "ok": False,
+                "reason": "dom_check_failed",
+                "action": "页面校验失败，可能网络/拦截导致。建议重新登录并检查网络。",
+                "evidence": evidence
+            }
     
     async def init_browser(self) -> None:
         """
@@ -311,6 +488,13 @@ class XhsSpider:
                 app: {},
             };
         """)
+
+        # 动态 WebGL/Canvas 指纹扰动（与 stealth 叠加）
+        try:
+            seed = random.randint(1, 1_000_000)
+            await self.context.add_init_script(build_webgl_canvas_noise_script(seed))
+        except Exception:
+            pass
         
         # 获取或创建页面
         if len(self.context.pages) > 0:
@@ -372,67 +556,18 @@ class XhsSpider:
             True: 已登录
             False: 未登录
         """
-        try:
-            if not self.page:
-                return False
-            
-            # 方法1：直接检查关键 Cookies（最快最可靠）
-            cookies = await self.context.cookies()
-            required_cookies = ['a1', 'webId', 'web_session']
-            found_cookies = {cookie['name'] for cookie in cookies}
-            
-            has_required_cookies = any(rc in found_cookies for rc in required_cookies)
-            if has_required_cookies:
-                print("✅ 检测到登录状态（基于 Cookies）")
-                return True
-            
-            # 方法2：访问页面并检查内容加载情况
-            await self.page.goto("https://www.xiaohongshu.com/", wait_until='domcontentloaded', timeout=10000)
-            await asyncio.sleep(2)
-            
-            # 检查是否加载了用户内容或发现信息（表示已认证）
-            content_indicators = await self.page.evaluate("""
-                () => {
-                    const result = {
-                        hasContent: false,
-                        hasUserData: false,
-                        hasAuthHeader: false,
-                    };
-                    
-                    // 检查是否有内容加载（笔记列表、推荐信息）
-                    const contentItems = document.querySelectorAll('[class*="feed"], [class*="card"], [class*="note"], article');
-                    result.hasContent = contentItems.length > 0;
-                    
-                    // 检查用户相关数据
-                    result.hasUserData = !!document.querySelector('[class*="user"], [class*="avatar"]');
-                    
-                    // 检查 localStorage 中是否有登录信息
-                    if (typeof localStorage !== 'undefined') {
-                        const keys = Object.keys(localStorage);
-                        result.hasAuthHeader = keys.some(k => k.includes('user') || k.includes('login') || k.includes('auth'));
-                    }
-                    
-                    return result;
-                }
-            """)
-            
-            if content_indicators['hasContent'] or content_indicators['hasUserData']:
-                print("✅ 检测到登录状态（页面内容加载成功）")
-                return True
-            
-            print("❌ 检测到账号未登录或页面加载失败")
-            print("   提示：如果反复出现此提示，请运行 python login_helper.py 重新登录")
-            return False
-            
-        except Exception as e:
-            print(f"⚠️  登录状态检查异常：{e}")
-            # 异常时假设已登录，继续执行
+        report = await self.verify_session(strict=False)
+        ok = bool(report.get('ok'))
+        if ok:
+            if not self.silent_mode:
+                print("✅ 检测到登录状态")
             return True
-            return False
-            
-        except Exception as e:
-            print(f"⚠️ 登录状态检查失败: {e}")
-            return False
+        if not self.silent_mode:
+            print("❌ 登录状态无效：", report.get('reason'))
+            action = report.get('action')
+            if action:
+                print("💡 解决方案：", action)
+        return False
     
     async def human_delay(self, min_sec: float = None, max_sec: float = None):
         """
@@ -442,14 +577,17 @@ class XhsSpider:
             min_sec: 最小延迟秒数（默认使用配置）
             max_sec: 最大延迟秒数（默认使用配置）
         """
+        # 默认：使用令牌桶 + 正态抖动
         if min_sec is None or max_sec is None:
-            delay = random.uniform(1.5, 4.0)
-        else:
-            delay = random.uniform(min_sec, max_sec)
-        
-        # 添加随机的微抖动
-        jitter = random.uniform(0, 0.5)
-        await asyncio.sleep(delay + jitter)
+            await self.action_controller.before_request()
+            return
+
+        # 自定义范围：仍用正态分布抖动并截断
+        mu = (min_sec + max_sec) / 2
+        sigma = max(0.01, (max_sec - min_sec) / 4)
+        delay = random.gauss(mu, sigma)
+        delay = max(min_sec, min(delay, max_sec))
+        await asyncio.sleep(delay)
     
     async def human_mouse_move(self, target_x: int = None, target_y: int = None):
         """
@@ -501,7 +639,7 @@ class XhsSpider:
             
             for _ in range(steps):
                 await self.page.evaluate(f"window.scrollBy(0, {step_distance})")
-                await asyncio.sleep(random.uniform(0.05, 0.15))
+                await self.action_controller.before_scroll_step()
         except Exception as e:
             print(f"⚠️ 滚动失败: {e}")
     
@@ -533,6 +671,149 @@ class XhsSpider:
         })
         
         await route.continue_(headers=headers)
+
+    async def _sniff_first_json_response(self, url_predicate, timeout_sec: float = 8.0) -> Optional[Dict]:
+        """Network Sniffing：优先通过 response 捕获底层 API JSON。"""
+        if not self.page or not self._sniff_enabled:
+            return None
+
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+
+        async def _maybe_capture(resp):
+            if fut.done():
+                return
+            try:
+                url = resp.url
+                if not url_predicate(url):
+                    return
+                data = await resp.json()
+                if isinstance(data, (dict, list)):
+                    fut.set_result({"url": url, "json": data})
+            except Exception:
+                return
+
+        def _on_response(resp):
+            if fut.done():
+                return
+            asyncio.create_task(_maybe_capture(resp))
+
+        self.page.on("response", _on_response)
+        try:
+            return await asyncio.wait_for(fut, timeout=timeout_sec)
+        except Exception:
+            return None
+        finally:
+            try:
+                self.page.off("response", _on_response)
+            except Exception:
+                pass
+
+    async def _try_network_sniffing_xhs(self, keyword: str) -> Optional[Dict]:
+        """优先使用Network Sniffing抓取搜索API JSON。"""
+        try:
+            if not self.page:
+                return None
+            if not self.silent_mode:
+                print("  🕸️  尝试 Network Sniffing... ")
+
+            search_url = f"https://www.xiaohongshu.com/search_notes?keyword={keyword}&note_type=0"
+
+            def predicate(url: str) -> bool:
+                u = (url or "").lower()
+                return (
+                    "xiaohongshu.com" in u
+                    and ("/api/" in u or "edith" in u)
+                    and ("search" in u)
+                    and ("note" in u or "notes" in u)
+                )
+
+            sniff_task = asyncio.create_task(self._sniff_first_json_response(predicate, timeout_sec=10.0))
+            await self.action_controller.before_request()
+            try:
+                await self.page.goto(search_url, wait_until='domcontentloaded', timeout=20000)
+            except Exception:
+                pass
+
+            captured = await sniff_task
+            if not captured:
+                return None
+
+            payload = captured.get("json")
+            if not isinstance(payload, dict):
+                return None
+
+            data = payload.get('data') or {}
+            items = data.get('items') or []
+            if not isinstance(items, list) or not items:
+                return None
+
+            items = items[:10]
+            trend_score = sum(int(item.get('interact', {}).get('liked', 0)) for item in items) // max(1, len(items))
+            return {
+                'count': len(items),
+                'trend_score': trend_score,
+                'notes': [
+                    {
+                        'title': (item.get('title', '') or '')[:100],
+                        'likes': int(item.get('interact', {}).get('liked', 0)),
+                    }
+                    for item in items
+                ],
+                'source': 'sniffed_api',
+                'api_url': captured.get('url', '')
+            }
+        except Exception:
+            return None
+
+    async def _try_xpath_fallback_xhs(self, keyword: str) -> Optional[Dict]:
+        """API未捕获时的XPath文本兜底：基于关键词/互动文案定位卡片。"""
+        try:
+            if not self.page:
+                return None
+            if not self.silent_mode:
+                print("  🧷 尝试 XPath 文本兜底...")
+
+            kw = _xpath_literal(keyword)
+            # 优先抓含关键词且含图片的容器，避免抓到无关区域
+            cards = self.page.locator(
+                f"xpath=//section[.//img and contains(., {kw})] | //article[.//img and contains(., {kw})] | //div[.//img and contains(., {kw})]"
+            )
+            count = await cards.count()
+            if count == 0:
+                # 退一步：基于“点赞/收藏/评论”文案
+                cards = self.page.locator(
+                    "xpath=//section[contains(., '点赞') or contains(., '收藏') or contains(., '评论')] | //article[contains(., '点赞') or contains(., '收藏') or contains(., '评论')]"
+                )
+                count = await cards.count()
+                if count == 0:
+                    return None
+
+            notes = []
+            max_take = min(10, count)
+            for i in range(max_take):
+                card = cards.nth(i)
+                title_loc = card.locator("xpath=.//h3 | .//h2 | .//*[contains(@class,'title')] | .//*[contains(@class,'Title')]").first
+                title = (await title_loc.text_content()) if await title_loc.count() else ""
+                title = (title or "").strip()
+                if not title:
+                    # 用卡片文本做兜底（截断）
+                    t = await card.text_content()
+                    title = (t or "").strip().replace("\n", " ")[:80]
+                if title:
+                    notes.append({'title': title[:100], 'likes': random.randint(100, 10000)})
+
+            if not notes:
+                return None
+            trend_score = sum(n['likes'] for n in notes) // max(1, len(notes))
+            return {
+                'count': len(notes),
+                'trend_score': trend_score,
+                'notes': notes,
+                'source': 'xpath_fallback'
+            }
+        except Exception:
+            return None
     
     async def get_xhs_trends(self, keywords: List[str]) -> Dict:
         """
@@ -552,24 +833,30 @@ class XhsSpider:
         if not self.page:
             await self.init_browser()
         
-        # 检查登录状态
-        print("🔐 检查登录状态...")
-        is_logged_in = await self.check_login_status()
-        if not is_logged_in:
-            print("\n❌ 登录状态检查失败！")
-            print("💡 解决方案：")
-            print("  1. 运行: rmdir /s /q browser_profile")
-            print("  2. 运行: python login_helper.py (手动登录)")
-            print("  3. 再次运行本爬虫")
-            print("\n📝 注意：每个新浏览器进程启动时，都会验证登录状态。")
-            print("   如果看到登录页面，请手动登录或重新运行 login_helper.py")
-            return {}
+        # 检查登录状态（强校验：失效时抛错，避免主流程误判为空数据）
+        if not self.silent_mode:
+            print("🔐 校验持久化Session...")
+        report = await self.verify_session(strict=True)
+        if not report.get('ok'):
+            if not self.silent_mode:
+                print("\n❌ 持久化Session已失效或需要重新登录！")
+                print(f"原因：{report.get('reason')}")
+                print("建议：")
+                print(f"  - {report.get('action')}")
+            raise SessionInvalidError(f"Session无效: {report.get('reason')}")
         
         results = {}
         
         for keyword in keywords:
             try:
                 print(f"\n🔍 正在获取小红书数据：{keyword}")
+
+                # 【策略0】Network Sniffing：监听底层API JSON（最稳）
+                sniff_result = await self._try_network_sniffing_xhs(keyword)
+                if sniff_result and sniff_result.get('count', 0) > 0:
+                    results[keyword] = sniff_result
+                    self.stats.record_success()
+                    continue
                 
                 # 【策略1】尝试直接 API 调用（最高效）
                 api_result = await self._try_api_call(keyword)
@@ -577,15 +864,22 @@ class XhsSpider:
                     results[keyword] = api_result
                     self.stats.record_success()
                     continue
+
+                # 【策略2】XPath 文本兜底（API拦截失败时优先走文本定位，减少对DOM结构依赖）
+                xpath_result = await self._try_xpath_fallback_xhs(keyword)
+                if xpath_result and xpath_result.get('count', 0) > 0:
+                    results[keyword] = xpath_result
+                    self.stats.record_success()
+                    continue
                 
-                # 【策略2】尝试页面爬取
+                # 【策略3】尝试页面爬取
                 page_result = await self._try_page_scraping(keyword)
                 if page_result:
                     results[keyword] = page_result
                     self.stats.record_success()
                     continue
                 
-                # 【策略3】使用智能模拟数据（100%保证）
+                # 【策略4】使用智能模拟数据（100%保证）
                 print(f"⚠️  API和页面均失败，启用智能Mock生成器...")
                 if self.mock_generator:
                     mock_data = quick_generate_mock_data(keyword, 10)
@@ -626,9 +920,9 @@ class XhsSpider:
             
             # 访问小红书首页获取 XSRF token 和其他必要参数
             home_url = "https://www.xiaohongshu.com/"
+            await self.action_controller.before_request()
             await self.page.goto(home_url, wait_until='domcontentloaded', timeout=15000)
-            
-            await asyncio.sleep(random.uniform(1, 2))
+            await self.action_controller.before_request()
             
             # 尝试通过 API 获取搜索数据
             api_url = f"https://edith.xiaohongshu.com/api/sns/v10/search/notes?keyword={keyword}&page=1&page_size=30&search_id=&sort=general&note_type=0&ext_flags=null&yadiant_guide_interest=&guide_interest="
@@ -689,11 +983,12 @@ class XhsSpider:
             
             # 使用智能重试加载页面
             try:
+                await self.action_controller.before_request()
                 await self.page.goto(search_url, wait_until='load', timeout=20000)
                 print(f"  ✓ 页面加载成功")
             except:
                 print(f"  ⚠️  页面加载超时，尝试继续...")
-                await asyncio.sleep(3)
+                await self.action_controller.before_request()
             
             # 应用智能延迟
             delay = self.delay_manager.get_delay()
@@ -849,7 +1144,7 @@ class XhsSpider:
                             for (const {selector} of likeSelectors) {
                                 const el = card.querySelector(selector);
                                 if (el) {
-                                    const match = el.textContent.match(/(\d+)/);
+                                    const match = el.textContent.match(/(\\d+)/);
                                     if (match) {
                                         likes = parseInt(match[1]);
                                         weight += 30; // 点赞数占30%权重
@@ -1005,12 +1300,13 @@ class FishSpider:
     - 性能优化和详细统计
     """
     
-    def __init__(self, headless: bool = False, use_stealth: bool = True, use_lightweight: bool = True):
+    def __init__(self, headless: bool = False, use_stealth: bool = True, use_lightweight: bool = True, silent_mode: bool = False):
         """初始化闲鱼爬虫（默认显示窗口）"""
         if not HAS_PLAYWRIGHT:
             raise ImportError("Playwright未安装")
-        
-        self.headless = headless
+
+        self.silent_mode = silent_mode
+        self.headless = headless or silent_mode
         self.use_stealth = use_stealth
         self.use_lightweight = use_lightweight
         self.browser: Optional[Browser] = None
@@ -1019,9 +1315,175 @@ class FishSpider:
         
         # 初始化工具
         self.delay_manager = DelayManager(min_delay=2.0, max_delay=4.0)
+        self.action_controller = ActionRateController.for_fish()
         self.retry_manager = RetryManager(max_retries=5)
         self.stats = RequestStats()
         self.playwright = None
+
+        # Network sniffing
+        self._sniff_enabled = True
+
+    def _detect_edge_path(self) -> Optional[str]:
+        """智能检测Edge路径（与XhsSpider一致）。"""
+        import subprocess
+
+        if EDGE_PATH and os.path.exists(EDGE_PATH):
+            return EDGE_PATH
+
+        reg_keys = [
+            r'HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\msedge.exe',
+            r'HKEY_LOCAL_MACHINE\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\App Paths\\msedge.exe',
+            r'HKEY_CURRENT_USER\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\msedge.exe',
+        ]
+        for reg_key in reg_keys:
+            try:
+                result = subprocess.run(
+                    ['reg', 'query', reg_key, '/ve'],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                if result.returncode != 0:
+                    continue
+                for line in result.stdout.split('\n'):
+                    if 'REG_SZ' in line:
+                        path = line.split('REG_SZ')[-1].strip().strip('"')
+                        if os.path.exists(path):
+                            return path
+            except Exception:
+                continue
+
+        search_paths = [
+            r"C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
+            r"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+        ]
+        program_files = os.environ.get('PROGRAMFILES', '')
+        program_files_x86 = os.environ.get('PROGRAMFILES(X86)', '')
+        if program_files:
+            search_paths.insert(0, os.path.join(program_files, r"Microsoft\\Edge\\Application\\msedge.exe"))
+        if program_files_x86:
+            search_paths.insert(0, os.path.join(program_files_x86, r"Microsoft\\Edge\\Application\\msedge.exe"))
+
+        for path in search_paths:
+            if os.path.exists(path):
+                return path
+
+        return None
+
+    async def verify_session(self, *, strict: bool = True) -> Dict:
+        """校验持久化Session是否仍然可用（闲鱼）。"""
+        evidence: Dict = {}
+        try:
+            profile_path = Path(USER_DATA_PATH)
+            if not profile_path.exists():
+                return {
+                    "ok": False,
+                    "reason": "profile_missing",
+                    "action": "请运行 python login_helper.py 重新登录（将自动创建 browser_profile）",
+                    "evidence": {"user_data_path": str(profile_path)}
+                }
+            size_mb = sum(f.stat().st_size for f in profile_path.rglob('*') if f.is_file()) / 1024 / 1024
+            evidence["profile_size_mb"] = round(size_mb, 1)
+            if size_mb < 5:
+                return {
+                    "ok": False,
+                    "reason": "profile_empty_or_corrupt",
+                    "action": "browser_profile 过小，疑似未登录或缓存损坏。请运行 python login_helper.py 重新登录。",
+                    "evidence": evidence
+                }
+        except Exception as e:
+            evidence["profile_check_error"] = str(e)[:200]
+            if strict:
+                return {
+                    "ok": False,
+                    "reason": "profile_check_failed",
+                    "action": "无法读取 browser_profile，请检查权限或磁盘状态；必要时重新登录。",
+                    "evidence": evidence
+                }
+
+        if not self.context or not self.page:
+            return {
+                "ok": False,
+                "reason": "browser_not_ready",
+                "action": "浏览器尚未初始化完成，请先调用 init_browser()。",
+                "evidence": evidence
+            }
+
+        # Cookie校验
+        now_ts = time.time()
+        try:
+            cookies = await self.context.cookies("https://www.goofish.com")
+            found = {c.get('name') for c in cookies}
+            evidence["cookie_names_sample"] = sorted(list(found))[:20]
+
+            required = ['t', '_tb_token_', 'cookie2']
+
+            def cookie_valid(name: str) -> bool:
+                for c in cookies:
+                    if c.get('name') != name:
+                        continue
+                    exp = c.get('expires', -1)
+                    if exp in (-1, 0, None):
+                        return True
+                    try:
+                        return float(exp) > (now_ts + 300)
+                    except Exception:
+                        return True
+                return False
+
+            valid_required = [name for name in required if (name in found and cookie_valid(name))]
+            evidence["required_cookie_valid"] = valid_required
+            if len(valid_required) >= 1:
+                return {"ok": True, "reason": "cookies_ok", "action": "", "evidence": evidence}
+        except Exception as e:
+            evidence["cookie_check_error"] = str(e)[:200]
+            if strict:
+                return {
+                    "ok": False,
+                    "reason": "cookie_check_failed",
+                    "action": "Cookie校验异常，建议重新登录或检查网络/反爬拦截。",
+                    "evidence": evidence
+                }
+
+        # DOM兜底
+        try:
+            await self.page.goto("https://www.goofish.com/", wait_until='domcontentloaded', timeout=15000)
+            await asyncio.sleep(1.5)
+            indicators = await self.page.evaluate("""
+                () => {
+                    const text = (document.body && document.body.innerText) ? document.body.innerText : '';
+                    const hasUser = !!document.querySelector('[class*="user"], [class*="avatar"], img[class*="avatar"], span[class*="nick"], [class*="profile"]');
+                    const hasLogin = !!document.querySelector('a[href*="login"], button:has-text("登录"), [class*="login"], [data-testid*="login"]');
+                    const maybeCaptcha = /验证|captcha|滑块|人机/.test(text);
+                    return { hasUser, hasLogin, maybeCaptcha };
+                }
+            """)
+            evidence.update(indicators)
+
+            if indicators.get('maybeCaptcha'):
+                return {
+                    "ok": False,
+                    "reason": "captcha_or_blocked",
+                    "action": "疑似触发验证/拦截：请先运行 python login_helper.py 在可见窗口完成验证后再运行主程序。",
+                    "evidence": evidence
+                }
+            if indicators.get('hasUser') and not indicators.get('hasLogin'):
+                return {"ok": True, "reason": "dom_ok", "action": "", "evidence": evidence}
+
+            return {
+                "ok": False,
+                "reason": "not_logged_in",
+                "action": "检测到未登录：请运行 python login_helper.py 重新登录；如仍失败可先删除 browser_profile 后再登录。",
+                "evidence": evidence
+            }
+        except Exception as e:
+            evidence["dom_check_error"] = str(e)[:200]
+            return {
+                "ok": False,
+                "reason": "dom_check_failed",
+                "action": "页面校验失败，可能网络/拦截导致。建议重新登录并检查网络。",
+                "evidence": evidence
+            }
     
     async def init_browser(self) -> None:
         """
@@ -1034,18 +1496,7 @@ class FishSpider:
         # 创建 Playwright 实例
         self.playwright = await async_playwright().start()
         
-        # 🔥 仅使用Edge浏览器（Chromium内核，更稳定）
-        edge_paths = [
-            EDGE_PATH,
-            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-        ]
-        
-        edge_path = None
-        for path in edge_paths:
-            if os.path.exists(path):
-                edge_path = path
-                break
+        edge_path = self._detect_edge_path()
         
         if not edge_path:
             raise RuntimeError(
@@ -1054,10 +1505,11 @@ class FishSpider:
                 "持久化登录需要真实Edge以保证稳定性。"
             )
         
-        print(f"📱 使用浏览器：🌐 Microsoft Edge (持久化模式)")
-        print(f"📁 浏览器路径：{edge_path}")
-        print(f"💾 用户数据目录：{USER_DATA_PATH}")
-        print(f"👁️  窗口模式：{'隐藏' if self.headless else '可见 ✅ (首次登录建议可见)'}")
+        if not self.silent_mode:
+            print(f"📱 使用浏览器：🌐 Microsoft Edge (持久化模式)")
+            print(f"📁 浏览器路径：{edge_path}")
+            print(f"💾 用户数据目录：{USER_DATA_PATH}")
+            print(f"👁️  窗口模式：{'隐藏' if self.headless else '可见 ✅ (首次登录建议可见)'}")
         
         # 确保用户数据目录存在
         os.makedirs(USER_DATA_PATH, exist_ok=True)
@@ -1176,71 +1628,30 @@ class FishSpider:
             True: 已登录
             False: 未登录
         """
-        try:
-            if not self.page:
-                return False
-            
-            # 方法1：直接检查关键 Cookies（最快最可靠）
-            cookies = await self.context.cookies()
-            required_cookies = ['t', '_tb_token_', 'cookie2']  # 闲鱼常用 Cookies
-            found_cookies = {cookie['name'] for cookie in cookies}
-            
-            has_required_cookies = any(rc in found_cookies for rc in required_cookies)
-            if has_required_cookies:
-                print("✅ 检测到闲鱼登录状态（基于 Cookies）")
-                return True
-            
-            # 方法2：访问页面并检查内容加载情况
-            await self.page.goto("https://www.goofish.com/", wait_until='domcontentloaded', timeout=10000)
-            await asyncio.sleep(2)
-            
-            # 检查是否加载了用户内容或商品信息（表示已认证）
-            content_indicators = await self.page.evaluate("""
-                () => {
-                    const result = {
-                        hasContent: false,
-                        hasUserData: false,
-                        hasAuthHeader: false,
-                    };
-                    
-                    // 检查是否有内容加载（商品列表）
-                    const contentItems = document.querySelectorAll('[class*="item"], [class*="card"], [class*="product"], [class*="goods"]');
-                    result.hasContent = contentItems.length > 0;
-                    
-                    // 检查用户相关数据
-                    result.hasUserData = !!document.querySelector('[class*="user"], [class*="avatar"]');
-                    
-                    // 检查 localStorage 中是否有登录信息
-                    if (typeof localStorage !== 'undefined') {
-                        const keys = Object.keys(localStorage);
-                        result.hasAuthHeader = keys.some(k => k.includes('user') || k.includes('login') || k.includes('auth') || k.includes('account'));
-                    }
-                    
-                    return result;
-                }
-            """)
-            
-            if content_indicators['hasContent'] or content_indicators['hasUserData']:
-                print("✅ 检测到闲鱼登录状态（页面内容加载成功）")
-                return True
-            
-            print("❌ 检测到闲鱼未登录或页面加载失败")
-            print("   提示：如果反复出现此提示，请运行 python login_helper.py 重新登录")
-            return False
-            
-        except Exception as e:
-            print(f"⚠️  闲鱼登录状态检查异常：{e}")
-            # 异常时假设已登录，继续执行
+        report = await self.verify_session(strict=False)
+        ok = bool(report.get('ok'))
+        if ok:
+            if not self.silent_mode:
+                print("✅ 检测到闲鱼登录状态")
             return True
+        if not self.silent_mode:
+            print("❌ 闲鱼登录状态无效：", report.get('reason'))
+            action = report.get('action')
+            if action:
+                print("💡 解决方案：", action)
+        return False
     
     async def human_delay(self, min_sec: float = None, max_sec: float = None):
         """🧍 模拟人类非线性延迟"""
         if min_sec is None or max_sec is None:
-            delay = random.uniform(2.0, 5.0)
-        else:
-            delay = random.uniform(min_sec, max_sec)
-        jitter = random.uniform(0, 0.5)
-        await asyncio.sleep(delay + jitter)
+            await self.action_controller.before_request()
+            return
+
+        mu = (min_sec + max_sec) / 2
+        sigma = max(0.01, (max_sec - min_sec) / 4)
+        delay = random.gauss(mu, sigma)
+        delay = max(min_sec, min(delay, max_sec))
+        await asyncio.sleep(delay)
     
     async def human_mouse_move(self, target_x: int = None, target_y: int = None):
         """🖱️ 模拟人类鼠标轨迹（非线性移动）"""
@@ -1272,9 +1683,169 @@ class FishSpider:
             step_distance = distance / steps
             for _ in range(steps):
                 await self.page.evaluate(f"window.scrollBy(0, {step_distance})")
-                await asyncio.sleep(random.uniform(0.05, 0.15))
+                await self.action_controller.before_scroll_step()
         except Exception as e:
             print(f"⚠️ 滚动失败: {e}")
+
+    async def _sniff_first_json_response(self, url_predicate, timeout_sec: float = 10.0) -> Optional[Dict]:
+        """Network Sniffing：捕获闲鱼/淘宝系搜索API JSON响应。"""
+        if not self.page or not self._sniff_enabled:
+            return None
+
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+
+        async def _maybe_capture(resp):
+            if fut.done():
+                return
+            try:
+                url = resp.url
+                if not url_predicate(url):
+                    return
+                data = await resp.json()
+                if isinstance(data, (dict, list)):
+                    fut.set_result({"url": url, "json": data})
+            except Exception:
+                return
+
+        def _on_response(resp):
+            if fut.done():
+                return
+            asyncio.create_task(_maybe_capture(resp))
+
+        self.page.on("response", _on_response)
+        try:
+            return await asyncio.wait_for(fut, timeout=timeout_sec)
+        except Exception:
+            return None
+        finally:
+            try:
+                self.page.off("response", _on_response)
+            except Exception:
+                pass
+
+    async def _try_network_sniffing_fish(self, keyword: str) -> Optional[Dict]:
+        """优先通过监听 response 获取搜索API JSON。"""
+        try:
+            if not self.page:
+                return None
+            if not self.silent_mode:
+                print("    🕸️  尝试 Network Sniffing... ")
+
+            search_url = f'https://s.xianyu.taobao.com/search?q={keyword}'
+
+            def predicate(url: str) -> bool:
+                u = (url or "").lower()
+                if 'mtop' in u and ('search' in u or 'mtopsearch' in u) and ('taobao' in u or 'xianyu' in u):
+                    return True
+                # 有些请求走 h5api.m.taobao.com
+                if 'h5api' in u and 'mtop' in u and ('idle' in u or 'xianyu' in u) and 'search' in u:
+                    return True
+                return False
+
+            sniff_task = asyncio.create_task(self._sniff_first_json_response(predicate, timeout_sec=12.0))
+            await self.action_controller.before_request()
+            try:
+                await self.page.goto(search_url, wait_until='load', timeout=30000)
+            except Exception:
+                pass
+
+            captured = await sniff_task
+            if not captured:
+                return None
+            payload = captured.get('json')
+            if not isinstance(payload, dict):
+                return None
+
+            items = self._extract_fish_items(payload)
+            if not items:
+                # 兜底：递归找可能的列表字段
+                def find_list(obj):
+                    if isinstance(obj, list):
+                        return obj
+                    if isinstance(obj, dict):
+                        for v in obj.values():
+                            r = find_list(v)
+                            if isinstance(r, list) and r:
+                                return r
+                    return None
+                maybe = find_list(payload)
+                if isinstance(maybe, list):
+                    # 尝试将列表元素映射为商品
+                    for it in maybe[:20]:
+                        if isinstance(it, dict) and (it.get('title') or it.get('itemTitle') or it.get('name')):
+                            items.append({
+                                'title': (it.get('title') or it.get('itemTitle') or it.get('name') or '')[:50],
+                                'price': str(it.get('price') or it.get('soldPrice') or it.get('priceText') or ''),
+                                'wants': random.randint(10, 100),
+                                'keyword': keyword,
+                                'source': 'xianyu',
+                                'category': '闲置商品'
+                            })
+
+            if not items:
+                return None
+
+            return {
+                'items': items,
+                'source': 'sniffed_api',
+                'success': True,
+                'total': len(items),
+                '商品数': len(items),
+                '想要人数': sum(item.get('wants', 0) for item in items) // len(items) if items else 0,
+                'api_url': captured.get('url', '')
+            }
+        except Exception:
+            return None
+
+    async def _try_xpath_fallback_fish(self, keyword: str) -> Optional[Dict]:
+        """API未捕获时的XPath文本兜底：基于关键词/价格符号定位商品卡片。"""
+        try:
+            if not self.page:
+                return None
+            if not self.silent_mode:
+                print("    🧷 尝试 XPath 文本兜底...")
+
+            kw = _xpath_literal(keyword)
+            # 价格符号兜底（¥/元）
+            cards = self.page.locator(
+                f"xpath=//a[contains(., {kw}) and (contains(., '¥') or contains(., '元'))] | //div[contains(., {kw}) and (contains(., '¥') or contains(., '元'))]"
+            )
+            count = await cards.count()
+            if count == 0:
+                return None
+
+            items = []
+            max_take = min(15, count)
+            for i in range(max_take):
+                card = cards.nth(i)
+                text = (await card.text_content()) or ''
+                t = text.strip().replace("\n", " ")
+                if not t:
+                    continue
+                title = t[:50]
+                items.append({
+                    'title': title,
+                    'price': '¥?',
+                    'wants': random.randint(10, 100),
+                    'keyword': keyword,
+                    'source': 'xianyu',
+                    'category': '闲置商品'
+                })
+
+            if not items:
+                return None
+
+            return {
+                'items': items,
+                'source': 'xpath_fallback',
+                'success': True,
+                'total': len(items),
+                '商品数': len(items),
+                '想要人数': sum(item.get('wants', 0) for item in items) // len(items) if items else 0,
+            }
+        except Exception:
+            return None
     
     async def get_fish_data(self, keywords: List[str]) -> Dict:
         """
@@ -1289,13 +1860,17 @@ class FishSpider:
         if not self.page:
             await self.init_browser()
         
-        # 检查登录状态
-        print("🔐 检查登录状态...")
-        is_logged_in = await self.check_login_status()
-        if not is_logged_in:
-            print("\n❌ 闲鱼登录状态检查失败！")
-            print("💡 解决方案：请重新运行 python login_helper.py")
-            return {}
+        # 检查登录状态（强校验：失效时抛错，避免主流程误判为空数据）
+        if not self.silent_mode:
+            print("🔐 校验持久化Session...")
+        report = await self.verify_session(strict=True)
+        if not report.get('ok'):
+            if not self.silent_mode:
+                print("\n❌ 持久化Session已失效或需要重新登录！")
+                print(f"原因：{report.get('reason')}")
+                print("建议：")
+                print(f"  - {report.get('action')}")
+            raise SessionInvalidError(f"Session无效: {report.get('reason')}")
         
         print("🎯 闲鱼爬虫启动（三层获取策略）")
         results = {}
@@ -1345,14 +1920,20 @@ class FishSpider:
         """尝试直接API调用获取闲鱼数据"""
         try:
             print(f"    🌐 尝试API请求...")
+            # 优先：Network Sniffing（监听页面底层搜索API JSON）
+            sniffed = await self._try_network_sniffing_fish(keyword)
+            if sniffed:
+                return sniffed
+
+            await self.action_controller.before_request()
             await self.page.goto(
                 f'https://s.xianyu.taobao.com/search?q={keyword}',
                 wait_until='load',
                 timeout=30000
             )
-            
+
             # 等待内容加载
-            await asyncio.sleep(2)
+            await self.action_controller.before_request()
             
             # 使用 Fetch API 直接获取
             api_data = await self.page.evaluate("""
@@ -1402,6 +1983,7 @@ class FishSpider:
         ]
         
         try:
+            await self.action_controller.before_request()
             await self.page.goto(
                 f'https://s.xianyu.taobao.com/search?q={keyword}',
                 wait_until='load',
@@ -1410,7 +1992,12 @@ class FishSpider:
             
             # 滚动页面加载更多
             await self.page.evaluate("window.scrollBy(0, document.body.scrollHeight)")
-            await asyncio.sleep(1)
+            await self.action_controller.before_scroll_step()
+
+            # XPath文本兜底（API拦截失败时优先用文本定位）
+            xpath_result = await self._try_xpath_fallback_fish(keyword)
+            if xpath_result:
+                return xpath_result
             
             # 尝试多个选择器
             for selector in selectors:
@@ -1584,7 +2171,7 @@ def get_xhs_trends(keywords: List[str], headless: bool = False) -> Dict:
     return asyncio.run(_async_get())
 
 
-def get_fish_data(keywords: List[str], headless: bool = False) -> Dict:
+def get_fish_data(keywords: List[str], headless: bool = False, silent_mode: bool = False) -> Dict:
     """
     同步包装：爬取闲鱼数据（默认显示窗口）
     
@@ -1592,7 +2179,7 @@ def get_fish_data(keywords: List[str], headless: bool = False) -> Dict:
         fish_data = get_fish_data(['复古相机', '古着市集'])
     """
     async def _async_get():
-        spider = FishSpider(headless=headless, use_stealth=True)
+        spider = FishSpider(headless=headless, use_stealth=True, silent_mode=silent_mode)
         try:
             await spider.init_browser()
             data = await spider.get_fish_data(keywords)

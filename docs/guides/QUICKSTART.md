@@ -6,10 +6,17 @@ pip install -r requirements.txt
 ```
 
 ## 2️⃣ 配置企业微信
-编辑 `config.py`：
-```python
-WECOM_WEBHOOK = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=YOUR_KEY"
+为避免把敏感 webhook 提交到 GitHub，本项目通过环境变量读取：
+
+```bash
+# PowerShell
+$env:WECOM_WEBHOOK='https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=YOUR_KEY'
+
+# CMD
+set WECOM_WEBHOOK=https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=YOUR_KEY
 ```
+
+未配置 `WECOM_WEBHOOK` 时将默认不推送。
 
 ## 3️⃣ 运行系统
 ```bash

@@ -11,7 +11,7 @@ from datetime import datetime
 from typing import List, Dict
 from pathlib import Path
 
-from scrapers.spider import get_xhs_trends, get_fish_data
+from scrapers.spider import get_xhs_trends, get_fish_data, SessionInvalidError
 from engine.analyzer import BlueOceanAnalyzer
 from utils.logic import NichePushLogic
 from config import (
@@ -229,7 +229,7 @@ class NicheHunterEngine:
             
             try:
                 # 调用 Playwright 爬虫
-                trends_data = get_xhs_trends(keyword_texts)
+                trends_data = get_xhs_trends(keyword_texts, headless=self.silent_mode)
                 
                 # 合并结果：使用爬虫获取的热搜数据，如果爬虫失败则使用本地数据
                 result_trends = []
@@ -262,7 +262,16 @@ class NicheHunterEngine:
                 logger.warning(f"Playwright 不可用，使用本地数据：{e}")
                 print(f"⚠️  Playwright 不可用，使用本地缓存数据")
                 print(f"   请运行：pip install playwright playwright-stealth")
-                
+                return keywords_list[:top_n]
+            except Exception as e:
+                # Session失效/被拦截等：明确提示并回退本地数据
+                logger.warning(f"在线爬取热搜失败，回退本地数据：{e}")
+                print("⚠️  在线爬取热搜失败，将回退到本地 xhs_data.json")
+                msg = str(e)
+                if "Session无效" in msg or "login" in msg.lower() or "登录" in msg:
+                    print("🔐 检测到登录/Session问题：")
+                    print("  1) 运行：python login_helper.py（可见窗口完成登录/验证）")
+                    print("  2) 若仍失败：先删除 browser_profile 后再登录")
                 return keywords_list[:top_n]
         
         except Exception as e:
@@ -294,7 +303,7 @@ class NicheHunterEngine:
             
             try:
                 # 查询闲鱼数据（需要传递列表）
-                fish_info = get_fish_data([keyword])
+                fish_info = get_fish_data([keyword], headless=self.silent_mode, silent_mode=self.silent_mode)
                 
                 # 计算蓝海指数
                 index, analysis = BlueOceanAnalyzer.calculate_detailed_index(
@@ -308,6 +317,34 @@ class NicheHunterEngine:
                 wait_time = random.uniform(*DELAY_BETWEEN_REQUESTS)
                 print(f"⏳ 冷却 {wait_time:.1f} 秒...")
                 time.sleep(wait_time)
+
+            except SessionInvalidError as e:
+                # 闲鱼Session失效：给出指引 + 回退本地数据（避免空结果/静默失败）
+                if not self.silent_mode:
+                    print("🔐 检测到闲鱼登录/Session问题：")
+                    print(f"  - {e}")
+                    print("  1) 运行：python login_helper.py（可见窗口完成登录/验证）")
+                    print("  2) 若仍失败：先删除 browser_profile 后再登录")
+                    print("⚠️  将尝试使用本地 fish_data.json 继续分析")
+
+                try:
+                    fish_file = Path('fish_data.json')
+                    if fish_file.exists():
+                        with open(fish_file, 'r', encoding='utf-8') as f:
+                            fish_data_dict = json.load(f)
+
+                        fish_info = fish_data_dict.get(keyword, {
+                            '商品数': 0,
+                            '想要人数': 0
+                        })
+                        index, analysis = BlueOceanAnalyzer.calculate_detailed_index(
+                            xhs_data={'word': keyword, 'heat': xhs_heat},
+                            fish_data=fish_info
+                        )
+                        results.append(analysis)
+                except Exception as local_e:
+                    logger.warning(f"使用本地闲鱼数据回退失败：{local_e}")
+                continue
             
             except ImportError as e:
                 # Playwright 未安装

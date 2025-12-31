@@ -30,6 +30,19 @@ python login_helper.py
 # 程序自动保存登录状态到 browser_profile/
 ```
 
+### 2.1 配置企业微信推送（可选，推荐用环境变量）
+为避免把敏感 webhook 提交到 GitHub，本项目通过环境变量读取：
+
+```bash
+# PowerShell
+$env:WECOM_WEBHOOK='https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxxx'
+
+# CMD
+set WECOM_WEBHOOK=https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxxx
+```
+
+未配置 `WECOM_WEBHOOK` 时将默认不推送。
+
 ### 3. 运行爬虫
 ```bash
 python main.py
@@ -157,7 +170,7 @@ python tests/final_verification.py
 
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
-| WECOM_WEBHOOK | 企业微信webhook | （需配置） |
+| WECOM_WEBHOOK | 企业微信webhook | 通过环境变量配置（见上文） |
 | MIN_POTENTIAL_SCORE | 推送阈值 | 200 |
 | MAX_COMPETITION | 竞争度上限 | 300 |
 | DELAY_BETWEEN_REQUESTS | 请求间隔 | (20, 30)秒 |

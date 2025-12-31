@@ -11,6 +11,8 @@ import random
 import time
 from typing import List, Dict, Optional
 from datetime import datetime
+import asyncio
+from dataclasses import dataclass
 
 # 尝试导入numpy（用于正态分布）
 try:
@@ -179,8 +181,8 @@ class DelayManager:
                 # 生成正态分布随机数
                 delay = np.random.normal(mu, sigma)
             else:
-                # 降级到简单随机
-                delay = random.uniform(self.min_delay, self.max_delay)
+                # 无numpy时仍使用正态分布（避免退化为均匀分布）
+                delay = random.gauss(mu, sigma)
             
             # 限制在合理范围内
             delay = max(self.min_delay, min(delay, self.max_delay))
@@ -195,6 +197,12 @@ class DelayManager:
         """执行延迟"""
         delay = self.get_delay(retry_count)
         time.sleep(delay)
+        return delay
+
+    async def async_sleep(self, retry_count: int = 0) -> float:
+        """异步延迟（Playwright推荐）。"""
+        delay = self.get_delay(retry_count)
+        await asyncio.sleep(delay)
         return delay
     
     def get_bucket_status(self) -> dict:
@@ -244,6 +252,227 @@ class HeaderBuilder:
             "Origin": "https://www.xiaohongshu.com",
         })
         return headers
+
+
+# ========================================
+# ✅ 令牌桶 + 正态抖动（面向 Playwright 动作）
+# ========================================
+
+
+class TokenBucket:
+        """令牌桶限流器（支持async acquire）。
+
+        - capacity: 桶容量（最大令牌数）
+        - fill_rate: 每秒补充令牌数
+
+        允许 cost 为浮点数，以便对滚动等轻量动作做更细粒度的节流。
+        """
+
+        def __init__(self, capacity: float = 10.0, fill_rate: float = 2.0):
+                self.capacity = float(capacity)
+                self.fill_rate = float(fill_rate)
+                self._tokens = float(capacity)
+                self._last_refill = time.monotonic()
+                self._lock = asyncio.Lock()
+
+        def _refill(self) -> None:
+                now = time.monotonic()
+                elapsed = max(0.0, now - self._last_refill)
+                if elapsed <= 0:
+                        return
+                self._tokens = min(self.capacity, self._tokens + elapsed * self.fill_rate)
+                self._last_refill = now
+
+        async def acquire(self, cost: float = 1.0) -> None:
+                cost = float(cost)
+                if cost <= 0:
+                        return
+                async with self._lock:
+                        while True:
+                                self._refill()
+                                if self._tokens >= cost:
+                                        self._tokens -= cost
+                                        return
+                                # 等待到足够令牌
+                                needed = cost - self._tokens
+                                wait_sec = needed / max(1e-6, self.fill_rate)
+                                await asyncio.sleep(min(wait_sec, 5.0))
+
+        def status(self) -> Dict[str, float]:
+                self._refill()
+                return {
+                        "tokens": round(self._tokens, 2),
+                        "capacity": round(self.capacity, 2),
+                        "fill_rate": round(self.fill_rate, 2),
+                }
+
+
+@dataclass(frozen=True)
+class JitterProfile:
+        """正态分布抖动配置（截断到[min_s, max_s]）。"""
+
+        min_s: float
+        max_s: float
+        mu: Optional[float] = None
+        sigma: Optional[float] = None
+
+        def sample(self) -> float:
+                mu = self.mu if self.mu is not None else (self.min_s + self.max_s) / 2
+                sigma = self.sigma if self.sigma is not None else (self.max_s - self.min_s) / 4
+                if HAS_NUMPY:
+                        val = float(np.random.normal(mu, sigma))
+                else:
+                        val = float(random.gauss(mu, sigma))
+                return max(self.min_s, min(val, self.max_s))
+
+
+class ActionRateController:
+        """对 click/scroll/request 统一做：令牌桶节流 + 正态抖动延迟。"""
+
+        def __init__(
+                self,
+                bucket: TokenBucket,
+                request_jitter: JitterProfile,
+                click_jitter: JitterProfile,
+                scroll_jitter: JitterProfile,
+                request_cost: float = 1.0,
+                click_cost: float = 0.8,
+                scroll_cost: float = 0.25,
+        ):
+                self.bucket = bucket
+                self.request_jitter = request_jitter
+                self.click_jitter = click_jitter
+                self.scroll_jitter = scroll_jitter
+                self.request_cost = request_cost
+                self.click_cost = click_cost
+                self.scroll_cost = scroll_cost
+
+        @staticmethod
+        def for_xhs() -> "ActionRateController":
+                bucket = TokenBucket(capacity=12.0, fill_rate=2.5)
+                return ActionRateController(
+                        bucket=bucket,
+                        request_jitter=JitterProfile(min_s=0.9, max_s=2.8),
+                        click_jitter=JitterProfile(min_s=0.25, max_s=1.2),
+                        scroll_jitter=JitterProfile(min_s=0.05, max_s=0.22),
+                )
+
+        @staticmethod
+        def for_fish() -> "ActionRateController":
+                bucket = TokenBucket(capacity=10.0, fill_rate=2.0)
+                return ActionRateController(
+                        bucket=bucket,
+                        request_jitter=JitterProfile(min_s=1.2, max_s=3.6),
+                        click_jitter=JitterProfile(min_s=0.3, max_s=1.5),
+                        scroll_jitter=JitterProfile(min_s=0.06, max_s=0.25),
+                )
+
+        async def before_request(self) -> float:
+                await self.bucket.acquire(self.request_cost)
+                delay = self.request_jitter.sample()
+                await asyncio.sleep(delay)
+                return delay
+
+        async def before_click(self) -> float:
+                await self.bucket.acquire(self.click_cost)
+                delay = self.click_jitter.sample()
+                await asyncio.sleep(delay)
+                return delay
+
+        async def before_scroll_step(self) -> float:
+                await self.bucket.acquire(self.scroll_cost)
+                delay = self.scroll_jitter.sample()
+                await asyncio.sleep(delay)
+                return delay
+
+
+def build_webgl_canvas_noise_script(seed: int) -> str:
+        """生成动态 WebGL + Canvas 指纹扰动脚本。
+
+        设计目标：
+        - 轻量、低风险：只对少量 API 做包装
+        - 可重复：同一 seed 在一次会话内保持一致
+        - 与 playwright-stealth 共存：作为补充扰动层
+        """
+        seed = int(seed) if seed is not None else random.randint(1, 1_000_000)
+        return f"""
+(() => {{
+    const __seed = {seed} >>> 0;
+    function __rand() {{
+        // xorshift32
+        let x = __seed ^ 0x9E3779B9;
+        x ^= x << 13; x ^= x >>> 17; x ^= x << 5;
+        return (x >>> 0) / 4294967296;
+    }}
+
+    // ----------------------
+    // Canvas noise
+    // ----------------------
+    const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
+    const origGetImageData = CanvasRenderingContext2D.prototype.getImageData;
+
+    function noisify(imageData) {{
+        try {{
+            const data = imageData.data;
+            // 只扰动少量像素，避免破坏渲染
+            const n = Math.min(10, Math.floor(data.length / 40000) + 4);
+            for (let i = 0; i < n; i++) {{
+                const idx = (Math.floor(__rand() * (data.length / 4)) * 4) | 0;
+                data[idx] = (data[idx] + 1) & 255;
+                data[idx+1] = (data[idx+1] + 1) & 255;
+                data[idx+2] = (data[idx+2] + 1) & 255;
+            }}
+        }} catch (e) {{}}
+        return imageData;
+    }}
+
+    CanvasRenderingContext2D.prototype.getImageData = function(...args) {{
+        const img = origGetImageData.apply(this, args);
+        return noisify(img);
+    }};
+
+    HTMLCanvasElement.prototype.toDataURL = function(...args) {{
+        try {{
+            const ctx = this.getContext('2d');
+            if (ctx) {{
+                const w = this.width || 0;
+                const h = this.height || 0;
+                if (w > 0 && h > 0) {{
+                    const img = origGetImageData.call(ctx, 0, 0, Math.min(w, 64), Math.min(h, 64));
+                    noisify(img);
+                    ctx.putImageData(img, 0, 0);
+                }}
+            }}
+        }} catch(e) {{}}
+        return origToDataURL.apply(this, args);
+    }};
+
+    // ----------------------
+    // WebGL vendor/renderer perturb
+    // ----------------------
+    const glGetParameter = WebGLRenderingContext.prototype.getParameter;
+    const vendorOptions = [
+        'Google Inc. (NVIDIA)',
+        'Google Inc. (Intel)',
+        'Google Inc. (AMD)'
+    ];
+    const rendererOptions = [
+        'ANGLE (NVIDIA, NVIDIA GeForce GTX 1650 Direct3D11 vs_5_0 ps_5_0)',
+        'ANGLE (Intel, Intel(R) UHD Graphics Direct3D11 vs_5_0 ps_5_0)',
+        'ANGLE (AMD, AMD Radeon(TM) Graphics Direct3D11 vs_5_0 ps_5_0)'
+    ];
+    const pick = (arr) => arr[Math.floor(__rand() * arr.length)];
+    const __vendor = pick(vendorOptions);
+    const __renderer = pick(rendererOptions);
+
+    WebGLRenderingContext.prototype.getParameter = function(param) {{
+        // UNMASKED_VENDOR_WEBGL=37445, UNMASKED_RENDERER_WEBGL=37446
+        if (param === 37445) return __vendor;
+        if (param === 37446) return __renderer;
+        return glGetParameter.apply(this, arguments);
+    }};
+}})();
+"""
 
 
 # 🔄 重试管理器

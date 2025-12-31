@@ -89,7 +89,7 @@ check_system.py          # 环境检查
 ```python
 EDGE_PATH = r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"
 USER_DATA_PATH = r"./browser_profile"  # 登录状态保存目录
-WECOM_WEBHOOK = "..."                  # 企业微信机器人
+WECOM_WEBHOOK = "..."                  # 企业微信机器人（建议用环境变量 WECOM_WEBHOOK 注入，避免提交敏感信息）
 MIN_POTENTIAL_SCORE = 120              # 蓝海指数阈值
 MAX_COMPETITION = 300                  # 竞争度阈值
 ```

@@ -44,6 +44,56 @@ class LoginHelper:
         self.playwright = None
         self.context = None
         self.page = None
+
+    def _detect_edge_path(self) -> str:
+        """智能检测Edge路径（与主爬虫一致：配置 > 注册表 > 环境变量 > 默认路径）。"""
+        import subprocess
+
+        if EDGE_PATH and os.path.exists(EDGE_PATH):
+            return EDGE_PATH
+
+        reg_keys = [
+            r'HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe',
+            r'HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe',
+            r'HKEY_CURRENT_USER\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe',
+        ]
+        for reg_key in reg_keys:
+            try:
+                result = subprocess.run(
+                    ['reg', 'query', reg_key, '/ve'],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                if result.returncode != 0:
+                    continue
+                for line in result.stdout.split('\n'):
+                    if 'REG_SZ' in line:
+                        path = line.split('REG_SZ')[-1].strip().strip('"')
+                        if os.path.exists(path):
+                            return path
+            except Exception:
+                continue
+
+        search_paths = [
+            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        ]
+        program_files = os.environ.get('PROGRAMFILES', '')
+        program_files_x86 = os.environ.get('PROGRAMFILES(X86)', '')
+        if program_files:
+            search_paths.insert(0, os.path.join(program_files, r"Microsoft\Edge\Application\msedge.exe"))
+        if program_files_x86:
+            search_paths.insert(0, os.path.join(program_files_x86, r"Microsoft\Edge\Application\msedge.exe"))
+
+        for path in search_paths:
+            if os.path.exists(path):
+                return path
+
+        raise RuntimeError(
+            "❌ Microsoft Edge浏览器未找到！\n"
+            "请安装Microsoft Edge或在config.py中配置EDGE_PATH。"
+        )
     
     async def init_browser(self):
         """初始化浏览器（可见模式）"""
@@ -51,24 +101,7 @@ class LoginHelper:
         
         self.playwright = await async_playwright().start()
         
-        # 检测Edge路径
-        edge_paths = [
-            EDGE_PATH,
-            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-        ]
-        
-        edge_path = None
-        for path in edge_paths:
-            if os.path.exists(path):
-                edge_path = path
-                break
-        
-        if not edge_path:
-            raise RuntimeError(
-                "❌ Microsoft Edge浏览器未找到！\n"
-                "请安装Microsoft Edge或在config.py中配置EDGE_PATH。"
-            )
+        edge_path = self._detect_edge_path()
         
         print(f"📱 使用浏览器：🌐 Microsoft Edge")
         print(f"📁 浏览器路径：{edge_path}")
@@ -168,10 +201,16 @@ class LoginHelper:
         
         # 验证登录状态
         await asyncio.sleep(2)
-            
+        is_logged_in = await self._check_xianyu_login()
+
+        if is_logged_in:
+            print("\n✅ 闲鱼登录成功！Session已保存到本地。")
+
             # 执行健康检查
             if HAS_MONITOR:
                 await self._perform_health_check("xianyu")
+            print(f"💾 数据位置：{USER_DATA_PATH}")
+            print("🎉 后续运行爬虫时会自动复用登录状态！")
         else:
             print("\n⚠️ 未检测到登录状态，请确认是否登录成功。")
     

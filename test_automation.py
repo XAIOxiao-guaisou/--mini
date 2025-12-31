@@ -325,7 +325,7 @@ class AutomationTester:
         self.test_config_validation()
         
         # 生成报告
-        self.generate_report()
+        return self.generate_report()
     
     def generate_report(self):
         """生成测试报告"""
