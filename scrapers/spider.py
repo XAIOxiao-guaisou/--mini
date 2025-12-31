@@ -25,7 +25,8 @@ from typing import List, Dict, Optional
 from enum import Enum
 import os
 from pathlib import Path
-from config import DELAY_BETWEEN_REQUESTS, USER_DATA_PATH, EDGE_PATH
+from config import DELAY_BETWEEN_REQUESTS, USER_DATA_PATH, EDGE_PATH, CHINA_PROXY_SERVER, REQUIRE_CHINA_NETWORK, CHINA_NETWORK_STRICT
+from utils.network_guard import ensure_china_network
 from .advanced_config import (
     PREMIUM_USER_AGENTS, PREMIUM_VIEWPORTS, LIGHTWEIGHT_BROWSER_ARGS,
     DelayManager, HeaderBuilder, RetryManager, ResponseValidator,
@@ -435,11 +436,13 @@ class XhsSpider:
         viewport = random.choice(PREMIUM_VIEWPORTS)
         user_agent = random.choice(PREMIUM_USER_AGENTS)
         
+        proxy = {"server": CHINA_PROXY_SERVER} if CHINA_PROXY_SERVER else None
         self.context = await self.playwright.chromium.launch_persistent_context(
             user_data_dir=USER_DATA_PATH,  # 持久化目录（保存登录状态）
             executable_path=edge_path,   # 使用Edge
             headless=self.headless,
             args=launch_args,
+            proxy=proxy,
             viewport=viewport,
             user_agent=user_agent,
             locale='zh-CN',
@@ -501,6 +504,10 @@ class XhsSpider:
             self.page = self.context.pages[0]
         else:
             self.page = await self.context.new_page()
+
+        # 按你的要求：启动后立即确认中国网络出口
+        if REQUIRE_CHINA_NETWORK:
+            ensure_china_network(strict=CHINA_NETWORK_STRICT)
         
         # 设置超时
         self.page.set_default_timeout(30000)
@@ -1529,11 +1536,13 @@ class FishSpider:
         viewport = random.choice(PREMIUM_VIEWPORTS)
         user_agent = random.choice(PREMIUM_USER_AGENTS)
         
+        proxy = {"server": CHINA_PROXY_SERVER} if CHINA_PROXY_SERVER else None
         self.context = await self.playwright.chromium.launch_persistent_context(
             user_data_dir=USER_DATA_PATH,  # 持久化目录（保存登录状态）
             executable_path=edge_path,   # 使用真实Edge
             headless=self.headless,
             args=launch_args,
+            proxy=proxy,
             viewport=viewport,
             user_agent=user_agent,
             locale='zh-CN',

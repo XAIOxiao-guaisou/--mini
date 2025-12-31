@@ -5,7 +5,7 @@
 
 import requests
 from typing import Dict, Optional
-from config import WECOM_WEBHOOK, MIN_POTENTIAL_SCORE, MAX_COMPETITION
+from config import WECOM_WEBHOOK, MIN_POTENTIAL_SCORE, MAX_COMPETITION, CHINA_PROXY_SERVER
 
 
 class NichePushLogic:
@@ -204,7 +204,11 @@ class NichePushLogic:
                 json=data,
                 headers={'Content-Type': 'application/json'},
                 timeout=10,
-                proxies={}  # 禁用代理，直接连接
+                proxies=(
+                    {"http": CHINA_PROXY_SERVER, "https": CHINA_PROXY_SERVER}
+                    if CHINA_PROXY_SERVER
+                    else {}
+                )
             )
             
             result = response.json()

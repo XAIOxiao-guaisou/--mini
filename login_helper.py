@@ -26,6 +26,7 @@ import asyncio
 from playwright.async_api import async_playwright
 from playwright_stealth import Stealth
 from config import USER_DATA_PATH, EDGE_PATH
+from utils.network_guard import ensure_china_network
 import os
 
 # 导入Session监控
@@ -98,6 +99,13 @@ class LoginHelper:
     async def init_browser(self):
         """初始化浏览器（可见模式）"""
         print("\n⏳ 正在启动浏览器（可见模式，Edge）...")
+
+        # 按要求：登录也尽量确保中国网络出口
+        try:
+            ensure_china_network(strict=True)
+        except Exception as e:
+            print(f"⚠️ 网络环境不符合要求：{e}")
+            raise
         
         self.playwright = await async_playwright().start()
         

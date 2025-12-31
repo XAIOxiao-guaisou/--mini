@@ -14,6 +14,7 @@ from pathlib import Path
 from scrapers.spider import get_xhs_trends, get_fish_data, SessionInvalidError
 from engine.analyzer import BlueOceanAnalyzer
 from utils.logic import NichePushLogic
+from utils.network_guard import ensure_china_network
 from config import (
     DELAY_BETWEEN_REQUESTS, 
     PUSH_INTERVAL,
@@ -24,6 +25,8 @@ from config import (
     MIN_POTENTIAL_SCORE,
     MAX_COMPETITION,
     XHS_DATA_FILE
+    ,REQUIRE_CHINA_NETWORK
+    ,CHINA_NETWORK_STRICT
 )
 
 

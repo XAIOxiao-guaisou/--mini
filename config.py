@@ -42,6 +42,13 @@ USE_DIRECT_CONNECTION = True         # 使用直接连接
 PROXY_DICT = {}                      # 空代理字典（不使用任何代理）
 NO_PROXY = '*'                       # 所有域名都不使用代理
 
+# ==================== 中国网络约束（你的需求） ====================
+# 说明：代码无法“强制把网络切到中国”，只能检测并在不符合时中止；
+# 如需在海外网络强制走中国出口，请设置 CHINA_PROXY_SERVER。
+REQUIRE_CHINA_NETWORK = True
+CHINA_NETWORK_STRICT = True
+CHINA_PROXY_SERVER = os.getenv("CHINA_PROXY_SERVER", "").strip()  # 例如 http://127.0.0.1:7890
+
 # ==================== 推送配置 ====================
 # 未配置 webhook 时默认关闭推送，避免运行时报错/避免误提交敏感信息
 ENABLE_WECOM_PUSH = bool(WECOM_WEBHOOK)  # 是否启用企业微信推送

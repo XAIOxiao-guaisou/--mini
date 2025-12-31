@@ -46,8 +46,7 @@ def check_config():
     with open(config_path, 'r', encoding='utf-8') as f:
         config_content = f.read()
         if 'WECOM_WEBHOOK = ""' in config_content or "WECOM_WEBHOOK = ''" in config_content:
-            print(f"{Colors.YELLOW}⚠️  警告：企业微信Webhook未配置{Colors.END}")
-            return False
+            print(f"{Colors.YELLOW}⚠️  提示：未配置企业微信Webhook，将跳过推送（可通过环境变量 WECOM_WEBHOOK 设置）{Colors.END}")
     
     print(f"{Colors.GREEN}✅ 配置文件检查通过{Colors.END}")
     return True
